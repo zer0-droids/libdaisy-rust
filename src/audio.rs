@@ -121,12 +121,12 @@ impl Audio {
         dma1_p: rec::Dma1,
         sai1_d: stm32::SAI1,
         sai1_p: rec::Sai1,
-
-        pe2: gpioe::PE2<Analog>,
-        pe3: gpioe::PE3<Analog>,
-        pe4: gpioe::PE4<Analog>,
-        pe5: gpioe::PE5<Analog>,
-        pe6: gpioe::PE6<Analog>,
+        // SAI pins
+        sai_mclk_a: gpioe::PE2<Analog>,
+        sai_sd_b: gpioe::PE3<Analog>,
+        sai_fs_a: gpioe::PE4<Analog>,
+        sai_sck_a: gpioe::PE5<Analog>,
+        sai_sd_a: gpioe::PE6<Analog>,
 
         clocks: &rcc::CoreClocks,
         mpu: &mut cortex_m::peripheral::MPU,
@@ -176,11 +176,11 @@ impl Audio {
             .set_frame_sync_active_high(true);
 
         let pins_a = (
-            pe2.into_alternate(),       // MCLK_A
-            pe5.into_alternate(),       // SCK_A
-            pe4.into_alternate(),       // FS_A
-            pe6.into_alternate(),       // SD_A
-            Some(pe3.into_alternate()), // SD_B
+            sai_mclk_a.into_alternate(),
+            sai_sck_a.into_alternate(),
+            sai_fs_a.into_alternate(),
+            sai_sd_a.into_alternate(),
+            Some(sai_sd_b.into_alternate()),
         );
 
         // Hand off to audio module

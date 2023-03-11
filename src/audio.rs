@@ -4,15 +4,23 @@ use log::info;
 
 use stm32h7xx_hal::{
     dma,
-    gpio::{gpioe, Analog},
-    pac, rcc,
+    gpio::{gpiob, gpioe, gpioh, Analog},
+    i2c::*,
+    pac,
+    prelude::*,
+    rcc,
     rcc::rec,
     sai,
     sai::*,
     stm32,
-    stm32::rcc::d2ccip1r::SAI1SEL_A,
     traits::i2s::FullDuplex,
 };
+
+use cortex_m::asm;
+use cortex_m::prelude::_embedded_hal_blocking_i2c_Write;
+
+use crate::delay_ms;
+use crate::system::DaisyVersion;
 
 // Process samples at 1000 Hz
 // With a circular buffer(*2) in stereo (*2)
@@ -41,21 +49,74 @@ pub const MAX_TRANSFER_SIZE: usize = BLOCK_SIZE_MAX * 2;
 
 pub type AudioBuffer = [(f32, f32); BLOCK_SIZE_MAX];
 
-type DmaInputStream = dma::Transfer<
+type DmaInputStream<Target> = dma::Transfer<
     dma::dma::Stream1<stm32::DMA1>,
-    stm32::SAI1,
+    Target,
     dma::PeripheralToMemory,
     &'static mut [u32; DMA_BUFFER_SIZE],
     dma::DBTransfer,
 >;
 
-type DmaOutputStream = dma::Transfer<
+type DmaOutputStream<Target> = dma::Transfer<
     dma::dma::Stream0<stm32::DMA1>,
-    stm32::SAI1,
+    Target,
     dma::MemoryToPeripheral,
     &'static mut [u32; DMA_BUFFER_SIZE],
     dma::DBTransfer,
 >;
+
+type DmaInputStreamRev4 = DmaInputStream<sai::dma::ChannelB<stm32::SAI1>>;
+type DmaInputStreamRev5 = DmaInputStream<sai::dma::ChannelA<stm32::SAI1>>;
+type DmaOutputStreamRev4 = DmaOutputStream<sai::dma::ChannelA<stm32::SAI1>>;
+type DmaOutputStreamRev5 = DmaOutputStream<sai::dma::ChannelB<stm32::SAI1>>;
+
+enum DmaInputStreamGeneric {
+    Rev4(DmaInputStreamRev4),
+    Rev5(DmaInputStreamRev5),
+}
+
+impl DmaInputStreamGeneric {
+    fn get_half_transfer_flag(&self) -> bool {
+        match self {
+            DmaInputStreamGeneric::Rev4(input_stream) => input_stream.get_half_transfer_flag(),
+            DmaInputStreamGeneric::Rev5(input_stream) => input_stream.get_half_transfer_flag(),
+        }
+    }
+
+    fn get_transfer_complete_flag(&self) -> bool {
+        match self {
+            DmaInputStreamGeneric::Rev4(input_stream) => input_stream.get_transfer_complete_flag(),
+            DmaInputStreamGeneric::Rev5(input_stream) => input_stream.get_transfer_complete_flag(),
+        }
+    }
+
+    fn clear_half_transfer_interrupt(&mut self) {
+        match self {
+            DmaInputStreamGeneric::Rev4(input_stream) => {
+                input_stream.clear_half_transfer_interrupt()
+            }
+            DmaInputStreamGeneric::Rev5(input_stream) => {
+                input_stream.clear_half_transfer_interrupt()
+            }
+        }
+    }
+
+    fn clear_transfer_complete_interrupt(&mut self) {
+        match self {
+            DmaInputStreamGeneric::Rev4(input_stream) => {
+                input_stream.clear_transfer_complete_interrupt()
+            }
+            DmaInputStreamGeneric::Rev5(input_stream) => {
+                input_stream.clear_transfer_complete_interrupt()
+            }
+        }
+    }
+}
+
+enum DmaOutputStreamGeneric {
+    Rev4(DmaOutputStreamRev4),
+    Rev5(DmaOutputStreamRev5),
+}
 
 type StereoIteratorHandle = fn(StereoIterator, &mut Output);
 
@@ -110,8 +171,8 @@ pub struct Audio {
     sai: sai::Sai<stm32::SAI1, sai::I2S>,
     input: Input,
     output: Output,
-    input_stream: DmaInputStream,
-    output_stream: DmaOutputStream,
+    input_stream: DmaInputStreamGeneric,
+    output_stream: DmaOutputStreamGeneric,
 }
 
 impl Audio {
@@ -121,12 +182,21 @@ impl Audio {
         dma1_p: rec::Dma1,
         sai1_d: stm32::SAI1,
         sai1_p: rec::Sai1,
+        i2c2_d: stm32::I2C2,
+        i2c2_p: rec::I2c2,
+
         // SAI pins
         sai_mclk_a: gpioe::PE2<Analog>,
         sai_sd_b: gpioe::PE3<Analog>,
         sai_fs_a: gpioe::PE4<Analog>,
         sai_sck_a: gpioe::PE5<Analog>,
         sai_sd_a: gpioe::PE6<Analog>,
+
+        // I2C pins
+        i2c_scl: gpioh::PH4<Analog>,
+        i2c_sda: gpiob::PB11<Analog>,
+
+        version: DaisyVersion,
 
         clocks: &rcc::CoreClocks,
         mpu: &mut cortex_m::peripheral::MPU,
@@ -145,33 +215,53 @@ impl Audio {
             .peripheral_increment(false)
             .circular_buffer(true)
             .fifo_enable(false);
-        let mut output_stream: dma::Transfer<_, _, dma::MemoryToPeripheral, _, _> =
-            dma::Transfer::init(
+        let mut output_stream: DmaOutputStreamGeneric = match version {
+            DaisyVersion::Rev4 => DmaOutputStreamGeneric::Rev4(dma::Transfer::init(
                 dma1_streams.0,
-                unsafe { pac::Peripherals::steal().SAI1 },
+                unsafe { pac::Peripherals::steal().SAI1.dma_ch_a() },
                 tx_buffer,
                 None,
                 dma_config,
-            );
+            )),
+            DaisyVersion::Rev5 => DmaOutputStreamGeneric::Rev5(dma::Transfer::init(
+                dma1_streams.0,
+                unsafe { pac::Peripherals::steal().SAI1.dma_ch_b() },
+                tx_buffer,
+                None,
+                dma_config,
+            )),
+        };
 
         // dma1 stream 1
         let rx_buffer: &'static mut [u32; DMA_BUFFER_SIZE] = unsafe { &mut RX_BUFFER };
         let dma_config = dma_config
             .transfer_complete_interrupt(true)
             .half_transfer_interrupt(true);
-        let mut input_stream: dma::Transfer<_, _, dma::PeripheralToMemory, _, _> =
-            dma::Transfer::init(
+        let mut input_stream: DmaInputStreamGeneric = match version {
+            DaisyVersion::Rev4 => DmaInputStreamGeneric::Rev4(dma::Transfer::init(
                 dma1_streams.1,
-                unsafe { pac::Peripherals::steal().SAI1 },
+                unsafe { pac::Peripherals::steal().SAI1.dma_ch_b() },
                 rx_buffer,
                 None,
                 dma_config,
-            );
+            )),
+            DaisyVersion::Rev5 => DmaInputStreamGeneric::Rev5(dma::Transfer::init(
+                dma1_streams.1,
+                unsafe { pac::Peripherals::steal().SAI1.dma_ch_a() },
+                rx_buffer,
+                None,
+                dma_config,
+            )),
+        };
 
         info!("Setup up SAI...");
-        let sai1_rec = sai1_p.kernel_clk_mux(SAI1SEL_A::Pll3P);
-        let master_config = I2SChanConfig::new(I2SDir::Tx).set_frame_sync_active_high(true);
-        let slave_config = I2SChanConfig::new(I2SDir::Rx)
+        let sai1_rec = sai1_p.kernel_clk_mux(rec::Sai1ClkSel::Pll3P);
+        let (ch_a_dir, ch_b_dir) = match version {
+            DaisyVersion::Rev4 => (I2SDir::Tx, I2SDir::Rx),
+            DaisyVersion::Rev5 => (I2SDir::Rx, I2SDir::Tx),
+        };
+        let master_config = I2SChanConfig::new(ch_a_dir).set_frame_sync_active_high(true);
+        let slave_config = I2SChanConfig::new(ch_b_dir)
             .set_sync_type(I2SSync::Internal)
             .set_frame_sync_active_high(true);
 
@@ -193,20 +283,38 @@ impl Audio {
             I2sUsers::new(master_config).add_slave(slave_config),
         );
 
-        input_stream.start(|_sai1_rb| {
-            sai.enable_dma(SaiChannel::ChannelB);
-        });
+        match version {
+            DaisyVersion::Rev4 => init_codec_ak4556(i2c_sda),
+            DaisyVersion::Rev5 => init_codec_wm8731(i2c2_d, i2c2_p, i2c_scl, i2c_sda, clocks),
+        }
 
-        output_stream.start(|sai1_rb| {
-            sai.enable_dma(SaiChannel::ChannelA);
+        info!("Start audio stream...");
+        match input_stream {
+            DmaInputStreamGeneric::Rev4(ref mut input_stream) => {
+                input_stream.start(|_sai1_rb| sai.enable_dma(SaiChannel::ChannelB))
+            }
+            DmaInputStreamGeneric::Rev5(ref mut input_stream) => {
+                input_stream.start(|_sai1_rb| sai.enable_dma(SaiChannel::ChannelA))
+            }
+        }
 
-            // wait until sai1's fifo starts to receive data
-            info!("Sai1 fifo waiting to receive data.");
-            while sai1_rb.cha().sr.read().flvl().is_empty() {}
-            info!("Audio started!");
-            sai.enable();
-            sai.try_send(0, 0).unwrap();
-        });
+        info!("Sai1 fifo waiting to receive data.");
+        match output_stream {
+            DmaOutputStreamGeneric::Rev4(ref mut output_stream) => output_stream.start(|sai1_rb| {
+                sai.enable_dma(SaiChannel::ChannelA);
+                while sai1_rb.cha().sr.read().flvl().is_empty() {}
+                sai.enable();
+                sai.try_send(0, 0).unwrap();
+            }),
+            DmaOutputStreamGeneric::Rev5(ref mut output_stream) => output_stream.start(|sai1_rb| {
+                sai.enable_dma(SaiChannel::ChannelB);
+                while sai1_rb.chb().sr.read().flvl().is_empty() {}
+                sai.enable();
+                sai.try_send(0, 0).unwrap();
+            }),
+        }
+
+        info!("Audio started!");
         let input = Input::new(unsafe { &mut RX_BUFFER });
         let output = Output::new(unsafe { &mut TX_BUFFER });
         info!(
@@ -382,5 +490,89 @@ impl Iterator for Mono<'_> {
         } else {
             None
         }
+    }
+}
+
+/// Initialize AK4556 (Rev4)
+fn init_codec_ak4556(reset: gpiob::PB11<Analog>) {
+    info!("Rest AK4556 Audio Codec...");
+    let mut reset = reset.into_push_pull_output();
+    reset.set_low();
+    delay_ms(5);
+    reset.set_high();
+}
+
+// - WM8731 codec register addresses -------------------------------------------------
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+enum Register {
+    LeftLineIn = 0x00,
+    RightLineIn = 0x01,
+    LeftHeadphoneOut = 0x02,
+    RightHeadphoneOut = 0x03,
+    AnalogAudioPathControl = 0x04,
+    DigitalAudioPathControl = 0x05,
+    PowerDownControl = 0x06,
+    DigitalAudioInterfaceFormat = 0x07,
+    SamplingControl = 0x08,
+    ActiveControl = 0x09, // 0000_1001
+    ResetRegister = 0x0F,
+}
+
+const REGISTER_CONFIG: &[(Register, u8)] = &[
+    // reset Codec: writing 0 to register resets the device
+    (Register::ResetRegister, 0x00),
+    // Set line inputs 0dB, disable mute
+    (Register::LeftLineIn, 0x17),
+    (Register::RightLineIn, 0x17),
+    // Mute headphones (not wired on daisy)
+    (Register::LeftHeadphoneOut, 0x00),
+    (Register::RightHeadphoneOut, 0x00),
+    // Mute mic (not wired), disable bypass and sidetone, select DAC
+    (Register::AnalogAudioPathControl, 0x12),
+    // Enable high pass filter, 48KHz de-emphasis, disable soft mute
+    (Register::DigitalAudioPathControl, 0x06),
+    // Disable power for clock-out and mic
+    (Register::PowerDownControl, 0x42),
+    // MSB-First left justified, 24 bits, right Channel DAC data when DACLRC
+    // low, swap left and right channels, slave mode, don't invert bit clock.
+    (Register::DigitalAudioInterfaceFormat, 0b11001),
+    // Normal mode, 48KHz with a 12Mhz MCLK
+    (Register::SamplingControl, 0x00),
+    // Disable and re-enable interface
+    (Register::ActiveControl, 0x00),
+    (Register::ActiveControl, 0x01),
+];
+
+/// Initialize WM8731 (Rev5)
+fn init_codec_wm8731(
+    i2c2_d: stm32::I2C2,
+    i2c2_p: rec::I2c2,
+    i2c_scl: gpioh::PH4<Analog>,
+    i2c_sda: gpiob::PB11<Analog>,
+    clocks: &rcc::CoreClocks,
+) {
+    info!("Setup WM8731 Audio Codec...");
+    let i2c2_pins = (
+        i2c_scl.into_alternate_open_drain(),
+        i2c_sda.into_alternate_open_drain(),
+    );
+
+    let mut i2c = i2c2_d.i2c(i2c2_pins, 100.kHz(), i2c2_p, clocks);
+
+    let codec_i2c_address: u8 = 0x1a; // or 0x1b if CSB is high
+
+    // Go through configuration setup
+    for (register, value) in REGISTER_CONFIG {
+        let register: u8 = *register as u8;
+        let value: u8 = *value as u8;
+        let byte1: u8 = ((register << 1) & 0b1111_1110_u8) | ((value >> 7) & 0b0000_0001_u8);
+        let byte2: u8 = value & 0b1111_1111_u8;
+        let bytes = [byte1, byte2];
+
+        i2c.write(codec_i2c_address, &bytes).unwrap_or_default();
+
+        // wait ~10us
+        asm::delay(5_000);
     }
 }

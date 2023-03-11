@@ -59,7 +59,7 @@ mod app {
 
         let mut gpio = gpio::GPIO::init(
             gpioc.pc7,
-            gpiob.pb11,
+            gpiod.pd3,
             Some(gpiob.pb12),
             Some(gpioc.pc11),
             Some(gpioc.pc10),

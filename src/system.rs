@@ -38,6 +38,11 @@ const PLL3_P_HZ: Hertz = Hertz::from_raw(AUDIO_SAMPLE_HZ.raw() * 257);
 const PLL3_Q_HZ: Hertz = Hertz::from_raw(PLL3_P_HZ.raw() / 4);
 const PLL3_R_HZ: Hertz = Hertz::from_raw(PLL3_P_HZ.raw() / 16);
 
+pub enum DaisyVersion {
+    Rev4,
+    Rev5,
+}
+
 pub struct System {
     pub gpio: crate::gpio::GPIO,
     pub audio: audio::Audio,
@@ -92,6 +97,17 @@ impl System {
         dcb.enable_trace();
         cortex_m::peripheral::DWT::unlock();
         dwt.enable_cycle_counter();
+    }
+
+    /// Check if it is a Rev4 or Rev5 board
+    pub fn get_daisy_version(gpio: &crate::gpio::GPIO) -> DaisyVersion {
+        if gpio.version.is_high() {
+            info!("Rev4");
+            DaisyVersion::Rev4
+        } else {
+            info!("Rev5");
+            DaisyVersion::Rev5
+        }
     }
 
     /// Batteries included initialization
@@ -206,26 +222,10 @@ impl System {
         )
         .into();
 
-        info!("Setup up Audio...");
-        let audio = Audio::new(
-            device.DMA1,
-            ccdr.peripheral.DMA1,
-            device.SAI1,
-            ccdr.peripheral.SAI1,
-            gpioe.pe2,
-            gpioe.pe3,
-            gpioe.pe4,
-            gpioe.pe5,
-            gpioe.pe6,
-            &ccdr.clocks,
-            &mut core.MPU,
-            &mut core.SCB,
-        );
-
         // Setup GPIOs
         let gpio = crate::gpio::GPIO::init(
             gpioc.pc7,
-            gpiob.pb11,
+            gpiod.pd3,
             Some(gpiob.pb12),
             Some(gpioc.pc11),
             Some(gpioc.pc10),
@@ -257,6 +257,27 @@ impl System {
             Some(gpioa.pa2),
             Some(gpiob.pb14),
             Some(gpiob.pb15),
+        );
+
+        info!("Setup up Audio...");
+        let audio = Audio::new(
+            device.DMA1,
+            ccdr.peripheral.DMA1,
+            device.SAI1,
+            ccdr.peripheral.SAI1,
+            device.I2C2,
+            ccdr.peripheral.I2C2,
+            gpioe.pe2,
+            gpioe.pe3,
+            gpioe.pe4,
+            gpioe.pe5,
+            gpioe.pe6,
+            gpioh.ph4,
+            gpiob.pb11,
+            Self::get_daisy_version(&gpio),
+            &ccdr.clocks,
+            &mut core.MPU,
+            &mut core.SCB,
         );
 
         // Setup cache
